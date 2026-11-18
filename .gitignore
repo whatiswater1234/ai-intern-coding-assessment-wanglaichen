@@ -12,3 +12,5 @@ build/
 coverage/
 *.log
 tmp/
+
+.task-service/

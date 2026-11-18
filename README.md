@@ -1,3 +1,60 @@
+# macOS 本机代码任务执行服务
+
+用 FastAPI 提交预置 Python 项目的检查、测试和构建任务。服务在 Mac 上启动真实进程，运行时可以看日志或取消，结束后可以下载报告和构建归档。开发和验收环境为 Apple Silicon macOS 26.6.2、Python 3.12。
+
+## 启动
+
+在仓库根目录使用 uv 安装锁定的依赖并启动：
+
+```bash
+uv sync --locked --python 3.12
+uv run --locked python -m task_service
+```
+
+浏览器打开 [交互接口文档](http://127.0.0.1:8765/docs)，或直接使用下方的 curl。服务仅监听本机回环地址。可用 `--port` 和 `--data-dir` 指定其他端口和数据目录。默认数据写入仓库下的 `.task-service/`；重启使用同一目录即可查询原任务。按 Ctrl-C 关闭服务。
+
+## 重放演示和验收
+
+下面两条命令会自行启动独立服务，分配临时端口和数据目录，退出时自行清理。可以在日常实例运行期间执行。
+
+```bash
+uv run --locked python scripts/demo.py
+uv run --locked python -m unittest discover -s tests/e2e -v
+```
+
+演示会运行一个通过的测试、一个真正失败的断言、一个带子进程的长测试，最后下载并执行构建归档，输出 `Hello, Mac!`。E2E 额外从宿主机验证进程退出、临时目录删除、日志截断、重启恢复和并发上限。进程与文件权限测试使用普通 macOS 用户运行。
+
+## 手动提交
+
+```bash
+curl -i http://127.0.0.1:8765/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"project_id":"hello","type":"build","timeout_seconds":30}'
+```
+
+创建成功返回 202 和带有任务 ID 的 Location 响应头。将下面的 ID 换成返回值即可查看执行过程。完成构建后再下载归档。
+
+```bash
+id='替换为返回的任务 ID'
+curl "http://127.0.0.1:8765/tasks/$id"
+curl "http://127.0.0.1:8765/tasks/$id/logs"
+curl "http://127.0.0.1:8765/tasks/$id/artifacts"
+curl -f -o /tmp/task-demo.pyz "http://127.0.0.1:8765/tasks/$id/artifacts/app.pyz"
+uv run --locked python /tmp/task-demo.pyz
+```
+
+| 预置项目 | 适合展示的操作 |
+| --- | --- |
+| `hello` | lint 做语法检查，test 检查问候语，build 生成可运行的 app.pyz |
+| `broken` | test 显示故意保留的失败断言和非零退出码 |
+| `slow` | test 启动一个长任务，日志出现 child_ready 后可调用 `POST /tasks/{id}/cancel`；也可在创建时指定 2 秒超时观察 timeout |
+
+服务同时执行 2 个任务，最多再接收 32 个排队任务。单任务保存前 64 KiB 日志，构建产物上限 5 MiB，终态数据保留七天。可用 `--projects` 指定维护者控制的预置项目目录；有测试的项目应包含 `tests/__init__.py`。这些项目以当前账号权限运行，仅适用于可信代码。
+
+设计文档说明了取消与完成的竞态、终态发布和故障恢复；AI 使用记录包含一次从错误结果追到系统调用的实测过程。[设计与边界](docs/DESIGN.md) · [AI 使用记录](docs/AI_USAGE.md)
+
+---
+
 # AI 效能平台实习考察题：代码任务执行服务
 
 本仓库是面向「AI 效能研发实习生」的考察题。候选人需要 fork 本仓库，在 3 天内实现一个可运行的小型服务，并在面试中演示与继续修改。
