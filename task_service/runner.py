@@ -11,6 +11,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
+from .archive import extract_archive
 from .storage import ARTIFACT_LIMIT, LOG_LIMIT, connect, decide, now, stage, task
 
 
@@ -18,9 +19,7 @@ class PreparationStopped(Exception):
     """An accepted stop request or deadline was observed before launching the command."""
 
 
-def copy_project(source, target, root, row):
-    if source.is_symlink() or not source.is_dir():
-        raise ValueError("预置项目目录无效")
+def make_checkpoint(root, row):
     next_check = 0.0
 
     def checkpoint():
@@ -34,6 +33,12 @@ def copy_project(source, target, root, row):
                     raise PreparationStopped
             next_check = stamp + 0.08
 
+    return checkpoint
+
+
+def copy_project(source, target, checkpoint):
+    if source.is_symlink() or not source.is_dir():
+        raise ValueError("预置项目目录无效")
     # Iterative traversal avoids Python's recursion limit for deep project trees.
     pending = [(source, target)]
     while pending:
@@ -217,6 +222,9 @@ def publish(root, task_id):
 def run(root, projects, task_id):
     with connect(root) as db:
         row = task(db, task_id)
+        source_row = db.execute(
+            "SELECT archive FROM task_sources WHERE task_id=?", (task_id,)
+        ).fetchone()
     work = root / "work" / task_id
     src, output, temp = work / "src", work / "out", work / "tmp"
     rc = error = archive = None
@@ -225,7 +233,11 @@ def run(root, projects, task_id):
         work.mkdir(mode=0o700)
         output.mkdir()
         temp.mkdir()
-        copy_project(projects / row["project_id"], src, root, row)
+        checkpoint = make_checkpoint(root, row)
+        if source_row is not None:
+            extract_archive(source_row["archive"], src, checkpoint)
+        else:
+            copy_project(projects / row["project_id"], src, checkpoint)
         args = {
             "lint": ["-I", "-m", "compileall", "-q", "."],
             "test": ["-I", "-B", "-u", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],

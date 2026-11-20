@@ -1,14 +1,18 @@
 import concurrent.futures
+import io
+import json
 import os
 import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+import zipfile
 from pathlib import Path
 
 from scripts.local_service import ROOT, LocalService, until
@@ -333,6 +337,158 @@ class TaskServiceTests(unittest.TestCase):
             self.assertIn(row["status"], {"cancelled", "succeeded"})
             self.assertEqual(row["status"], self.api.get(path + "/artifacts/result.json")["status"])
             self.assertEqual(row, self.api.request(path + "/cancel", "POST")[1])
+
+    def test_web_workbench_catalog_and_task_listing(self):
+        api = self.api
+        status, html = api.request("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"/static/app.js", html)
+        self.assertEqual(api.request("/static/styles.css")[0], 200)
+        self.assertEqual(api.request("/static/app.js")[0], 200)
+
+        catalog = api.get("/projects")
+        self.assertEqual((catalog["workers"], catalog["queue_limit"]), (2, 32))
+        by_id = {item["id"]: item for item in catalog["projects"]}
+        self.assertEqual(
+            by_id["hello"], {"id": "hello", "has_tests": True, "has_main": True, "file_count": 4}
+        )
+        self.assertEqual(
+            by_id["broken"], {"id": "broken", "has_tests": True, "has_main": False, "file_count": 3}
+        )
+        self.assertIn("pipeline", by_id)
+        self.assertIn("logflood", by_id)
+        hello_files = api.get("/projects/hello/files")
+        self.assertIn("greeting.py", [f["path"] for f in hello_files["files"]])
+
+        first = api.submit("hello", "test")
+        second = api.submit("broken", "test")
+        api.finished(first)
+        api.finished(second)
+
+        slow = api.submit("slow", "test")
+        pids = self.ready(slow)
+        try:
+            listing = api.get("/tasks?limit=2")
+            self.assertEqual(len(listing["items"]), 2)
+            self.assertEqual(listing["running_count"], 1)
+            self.assertEqual(listing["active_tasks"][0]["id"], slow.rsplit("/", 1)[1])
+            passed = api.get("/tasks?status=succeeded")
+            self.assertEqual([row["id"] for row in passed["items"]], [first.rsplit("/", 1)[1]])
+            self.assertEqual(api.request("/tasks?status=invalid")[0], 422)
+            self.assertEqual(api.request("/tasks?limit=0")[0], 422)
+
+            telemetry = api.get("/telemetry")
+            self.assertEqual(telemetry["slots"]["running"], 1)
+            self.assertEqual(telemetry["slots"]["capacity"], 2)
+            self.assertGreaterEqual(telemetry["slots"]["task_processes"], 2)
+            self.assertGreater(telemetry["slots"]["task_rss_bytes"], 0)
+            self.assertEqual(telemetry["sandbox"]["active_workspaces"], 1)
+            self.assertGreaterEqual(telemetry["metrics"]["finished_tasks"], 2)
+        finally:
+            api.request(slow + "/cancel", "POST")
+            api.finished(slow)
+            for pid in pids:
+                until(lambda pid=pid: absent(pid))
+
+        idle_telemetry = api.get("/telemetry")
+        self.assertEqual(idle_telemetry["slots"]["running"], 0)
+        self.assertEqual(idle_telemetry["sandbox"]["active_workspaces"], 0)
+
+    def test_inline_source_archive_upload_security_and_sse(self):
+        api = self.api
+        # Reject specifying both or neither of project_id and files
+        self.assertEqual(
+            api.request(
+                "/tasks",
+                "POST",
+                {"project_id": "hello", "files": {"a.py": "x=1\n"}, "type": "lint"},
+            )[0],
+            422,
+        )
+        self.assertEqual(
+            api.request("/tasks", "POST", {"files": {"../escape.py": "x=1"}, "type": "lint"})[0],
+            422,
+        )
+
+        # Inline edited workspace execution + source inspection
+        status, queued = api.request(
+            "/tasks",
+            "POST",
+            {
+                "label": "broken-fixed",
+                "type": "test",
+                "files": {
+                    "tests/__init__.py": "",
+                    "tests/test_sum.py": (
+                        "import unittest\n"
+                        "class FixedTest(unittest.TestCase):\n"
+                        "    def test_ok(self):\n"
+                        "        self.assertEqual(sum([12, 8]), 20)\n"
+                    ),
+                },
+            },
+        )
+        self.assertEqual(status, 202)
+        inline_path = "/tasks/" + queued["id"]
+        inline_row = api.finished(inline_path)
+        self.assertEqual((inline_row["status"], inline_row["source_kind"]), ("succeeded", "inline"))
+        src_snapshot = api.get(inline_path + "/source")
+        self.assertEqual(src_snapshot["source_kind"], "inline")
+        self.assertEqual(len(src_snapshot["files"]), 2)
+
+        # ZIP archive upload with macOS __MACOSX noise and single outer directory wrapper
+        good_zip = io.BytesIO()
+        with zipfile.ZipFile(good_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("__MACOSX/._meta", b"ignored")
+            zf.writestr("my_pkg/.DS_Store", b"ignored")
+            zf.writestr("my_pkg/__main__.py", 'print("From ZIP!")\n')
+        status, zq = api.request(
+            "/tasks/archive?type=build&filename=my_pkg.zip",
+            "POST",
+            good_zip.getvalue(),
+            "application/zip",
+        )
+        self.assertEqual(status, 202)
+        zip_path = "/tasks/" + zq["id"]
+        zip_row = api.finished(zip_path)
+        self.assertEqual((zip_row["status"], zip_row["source_kind"]), ("succeeded", "archive"))
+        built = self.folder / "from_zip.pyz"
+        built.write_bytes(api.get(zip_path + "/artifacts/app.pyz"))
+        self.assertEqual(
+            subprocess.check_output([sys.executable, built], text=True), "From ZIP!\n"
+        )
+
+        # SSE stream emits state/logs and closes on terminal completion
+        sse_task = api.submit("hello", "test")
+        status_code, sse_raw = api.request(sse_task + "/events")
+        self.assertEqual(status_code, 200)
+        frames = [
+            json.loads(line.removeprefix("data: "))
+            for line in sse_raw.decode().splitlines()
+            if line.startswith("data: ")
+        ]
+        self.assertTrue(frames)
+        self.assertEqual(frames[-1]["task"]["status"], "succeeded")
+        self.assertIn("OK", frames[-1]["logs"]["text"])
+
+        # Reject zip-slip traversal and symlink inside uploaded ZIP
+        slip_zip = io.BytesIO()
+        with zipfile.ZipFile(slip_zip, "w") as zf:
+            zf.writestr("../evil.py", "pass")
+        self.assertEqual(
+            api.request("/tasks/archive?type=lint", "POST", slip_zip.getvalue(), "application/zip")[0],
+            422,
+        )
+
+        link_zip = io.BytesIO()
+        with zipfile.ZipFile(link_zip, "w") as zf:
+            info = zipfile.ZipInfo("link.py")
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(info, "/etc/passwd")
+        self.assertEqual(
+            api.request("/tasks/archive?type=lint", "POST", link_zip.getvalue(), "application/zip")[0],
+            422,
+        )
 
     def test_history_expiry(self):
         expired = self.api.submit(kind="build")

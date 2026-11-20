@@ -13,6 +13,12 @@ ARTIFACT_LIMIT = 5 * 1024 * 1024
 WORKERS = 2
 QUEUE_LIMIT = 32
 
+TASK_SELECT = """
+    SELECT tasks.*, COALESCE(task_sources.source_kind, 'preset') AS source_kind
+    FROM tasks
+    LEFT JOIN task_sources ON task_sources.task_id = tasks.id
+"""
+
 
 class ServiceError(Exception):
     def __init__(self, status, code, message):
@@ -59,11 +65,16 @@ def initialize(root):
                 name TEXT NOT NULL, media_type TEXT NOT NULL, content BLOB NOT NULL,
                 PRIMARY KEY (task_id, name)
             );
+            CREATE TABLE IF NOT EXISTS task_sources (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                source_kind TEXT NOT NULL,
+                archive BLOB NOT NULL
+            );
         """)
 
 
 def task(db, task_id):
-    row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    row = db.execute(f"{TASK_SELECT} WHERE tasks.id=?", (task_id,)).fetchone()
     if row is None:
         raise ServiceError(404, "task_not_found", "任务不存在")
     return row
@@ -74,6 +85,7 @@ def snapshot(row):
         "id",
         "type",
         "project_id",
+        "source_kind",
         "timeout_seconds",
         "status",
         "created_at",
@@ -90,7 +102,34 @@ def snapshot(row):
     return result
 
 
-def enqueue(root, project_id, kind, timeout):
+def list_tasks(root, limit=50, status=None):
+    with connect(root) as db:
+        running_rows = db.execute(
+            f"{TASK_SELECT} WHERE tasks.status='running' ORDER BY tasks.seq ASC"
+        ).fetchall()
+        queued_count = db.execute(
+            "SELECT count(*) FROM tasks WHERE status='queued'"
+        ).fetchone()[0]
+        if status is None:
+            rows = db.execute(
+                f"{TASK_SELECT} ORDER BY tasks.seq DESC LIMIT ?", (limit,)
+            ).fetchall()
+        else:
+            rows = db.execute(
+                f"{TASK_SELECT} WHERE tasks.status=? ORDER BY tasks.seq DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+    return {
+        "items": [snapshot(row) for row in rows],
+        "active_tasks": [snapshot(row) for row in running_rows],
+        "running_count": len(running_rows),
+        "queued_count": queued_count,
+        "workers": WORKERS,
+        "queue_limit": QUEUE_LIMIT,
+    }
+
+
+def enqueue(root, project_id, kind, timeout, *, source_kind="preset", archive=None):
     task_id = str(uuid.uuid4())
     with connect(root, write=True) as db:
         count = db.execute("SELECT count(*) FROM tasks WHERE status='queued'").fetchone()[0]
@@ -101,6 +140,11 @@ def enqueue(root, project_id, kind, timeout):
                       VALUES (?,?,?,?,?)""",
             (task_id, project_id, kind, timeout, now()),
         )
+        if archive is not None:
+            db.execute(
+                "INSERT INTO task_sources(task_id,source_kind,archive) VALUES (?,?,?)",
+                (task_id, source_kind, archive),
+            )
     return task_id
 
 
@@ -145,11 +189,15 @@ def stage(root, task_id, rc, error=None, archive=None):
             error = error or {"code": "nonzero_exit", "message": f"命令退出码为 {rc}"}
         else:
             status = "succeeded"
+        current = task(db, task_id)
         report = {
             "id": task_id,
-            "type": task(db, task_id)["type"],
+            "project_id": current["project_id"],
+            "source_kind": current["source_kind"],
+            "type": current["type"],
             "status": status,
             "exit_code": rc,
+            "started_at": current["started_at"],
             "error": error,
         }
         db.execute(

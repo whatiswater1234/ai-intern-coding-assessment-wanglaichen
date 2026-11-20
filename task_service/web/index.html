@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TaskRunner · 本机代码任务执行服务</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <!-- 顶部极简导航栏 -->
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand-group">
+          <div class="brand-logo" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+              <path
+                d="M7 8L12 12L7 16"
+                stroke="currentColor"
+                stroke-width="2.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+              <path d="M13.5 16H17.5" stroke="#818CF8" stroke-width="2.4" stroke-linecap="round" />
+            </svg>
+          </div>
+          <span class="brand-name">TaskRunner</span>
+          <span id="online-badge" class="online-badge" data-online="true">
+            <span class="online-dot"></span>
+            <span id="online-text">在线</span>
+          </span>
+        </div>
+
+        <div class="topbar-actions">
+          <span
+            id="host-chip"
+            class="host-chip"
+            data-tip-title="宿主机与 API 进程状态"
+            data-tip-body="实时采集 macOS CPU 核心数、系统平均负载与当前 FastAPI 控制进程常驻内存。"
+          >
+            Apple Silicon · 读取中
+          </span>
+          <button
+            id="open-editor-modal-btn"
+            type="button"
+            class="top-btn"
+            data-tip-title="在线修改源码运行"
+            data-tip-body="打开内置代码编辑器，修改任意预置项目的 Python 代码或新增文件，在独立 0700 沙箱运行。"
+          >
+            ✎ 在线改码
+          </button>
+          <button
+            id="open-zip-modal-btn"
+            type="button"
+            class="top-btn"
+            data-tip-title="上传本地 ZIP 代码包"
+            data-tip-body="支持拖拽 ≤ 2 MiB 的 .zip 项目包运行，自动清洗 __MACOSX 并拦截路径穿越与符号链接。"
+          >
+            ⬆ 上传 ZIP
+          </button>
+          <a href="/docs" target="_blank" rel="noopener" class="top-btn top-btn--link">API ↗</a>
+        </div>
+      </div>
+    </header>
+
+    <main class="page-container">
+      <!-- 第一区：干爽数字遥测带（细节悬停可见） -->
+      <section class="telemetry-grid" aria-label="系统实时监控">
+        <article
+          id="card-telemetry-workers"
+          class="metric-card"
+          data-tip-title="并发执行槽与子进程组资源"
+          data-tip-body="最多并行运行 2 个独立 Python runner 执行器；实时按任务 PGID 汇总组内存活子进程数、RSS 物理内存与 CPU 占用。"
+        >
+          <div class="metric-head">
+            <span class="metric-label">并发执行槽</span>
+            <span id="slot-util-tag" class="metric-tag" data-tone="idle">空闲</span>
+          </div>
+          <div class="metric-main-row">
+            <strong id="slot-ratio-val" class="metric-value">0 / 2</strong>
+            <span id="worker-proc-summary" class="metric-inline">0 进程 · 0 B</span>
+          </div>
+          <div class="progress-track">
+            <div id="slot-progress-bar" class="progress-fill progress-fill--indigo" style="width: 0%"></div>
+          </div>
+        </article>
+
+        <article
+          id="card-telemetry-queue"
+          class="metric-card"
+          data-tip-title="FIFO 等待队列与调度延迟"
+          data-tip-body="双执行槽满载时新任务进入 SQLite 持久化 FIFO 队列（容量上限 32，超出返回 HTTP 429）；槽位释放后毫秒级自动补位。"
+        >
+          <div class="metric-head">
+            <span class="metric-label">FIFO 队列</span>
+            <span id="queue-status-tag" class="metric-tag" data-tone="idle">畅通</span>
+          </div>
+          <div class="metric-main-row">
+            <strong id="queue-ratio-val" class="metric-value">0 / 32</strong>
+            <span id="latency-summary" class="metric-inline">排队 0 ms</span>
+          </div>
+          <div class="progress-track">
+            <div id="queue-progress-bar" class="progress-fill progress-fill--amber" style="width: 0%"></div>
+          </div>
+        </article>
+
+        <article
+          id="card-telemetry-sandbox"
+          class="metric-card"
+          data-tip-title="隔离沙箱与进程零泄漏保证"
+          data-tip-body="每个任务在 0700 权限的 work/<id> 私有目录执行；终态发布前强制向整个进程组发送 SIGTERM → SIGKILL 并彻底删除临时目录。"
+          data-tip-meta="配额：日志上限 64 KB · 产物上限 5 MB · ZIP 上限 2 MB"
+        >
+          <div class="metric-head">
+            <span class="metric-label">活动沙箱</span>
+            <span id="hygiene-tag" class="metric-tag" data-tone="ok">✓ 零残留</span>
+          </div>
+          <div class="metric-main-row">
+            <strong id="workspace-count-val" class="metric-value">0</strong>
+            <span id="quarantine-summary" class="metric-inline">0700 隔离</span>
+          </div>
+          <div class="progress-track">
+            <div id="sandbox-progress-bar" class="progress-fill progress-fill--emerald" style="width: 100%"></div>
+          </div>
+        </article>
+
+        <article
+          id="card-telemetry-stats"
+          class="metric-card"
+          data-tip-title="执行结果分布与持久化存储"
+          data-tip-body="全部状态、截断日志与构建产物均存储在 SQLite WAL 数据库中，重启服务不丢失，超过 7 天的历史终态记录自动回收。"
+        >
+          <div class="metric-head">
+            <span class="metric-label">累计通过率</span>
+            <span id="storage-size-tag" class="metric-tag" data-tone="idle">0 KB</span>
+          </div>
+          <div class="metric-main-row">
+            <strong id="pass-rate-val" class="metric-value">—</strong>
+            <span id="total-runs-summary" class="metric-inline">共 0 次</span>
+          </div>
+          <div class="stacked-bar" aria-hidden="true">
+            <div id="bar-seg-pass" class="seg-pass" style="width: 0%"></div>
+            <div id="bar-seg-fail" class="seg-fail" style="width: 0%"></div>
+            <div id="bar-seg-warn" class="seg-warn" style="width: 0%"></div>
+            <div id="bar-seg-cancel" class="seg-cancel" style="width: 0%"></div>
+          </div>
+        </article>
+      </section>
+
+      <!-- 第二区：任务仓库与单次派发（无冗余段落，悬停看详情） -->
+      <section class="section-block" aria-labelledby="catalog-heading">
+        <div class="section-head">
+          <div class="eyebrow-row">
+            <h2 id="catalog-heading" class="section-title">预置任务仓库</h2>
+            <span
+              class="hint-dot"
+              tabindex="0"
+              data-tip-title="预置模拟项目说明"
+              data-tip-body="内置 5 个不同特性的可信 Python 模块。鼠标移至卡片可查看详细设计意图；点击选中后可在下方直接派发任务，或点「源码」在线改码。"
+            >?</span>
+          </div>
+        </div>
+
+        <div id="catalog-cards" class="catalog-grid" role="radiogroup" aria-label="选择预置任务仓库"></div>
+
+        <!-- 紧凑单行派发条 -->
+        <form id="direct-dispatch-form" class="dispatch-strip" novalidate>
+          <div class="dispatch-left">
+            <div class="selected-proj-box">
+              <span class="ctrl-label">目标</span>
+              <code id="selected-proj-badge" class="selected-proj-code">hello</code>
+            </div>
+
+            <div class="ctrl-divider"></div>
+
+            <div class="pill-radios" role="radiogroup" aria-label="任务类型">
+              <button
+                type="button"
+                class="pill-radio"
+                role="radio"
+                aria-checked="false"
+                data-dtype="lint"
+                data-tip-title="代码检查 (lint)"
+                data-tip-body="执行 python -I -m compileall -q . 静态检查全部源码语法。"
+              >
+                检查 <code>lint</code>
+              </button>
+              <button
+                type="button"
+                class="pill-radio"
+                role="radio"
+                aria-checked="true"
+                data-dtype="test"
+                data-tip-title="单元测试 (test)"
+                data-tip-body="执行 python -I -B -u -m unittest discover -s tests -v 并实时回传断言日志。"
+              >
+                测试 <code>test</code>
+              </button>
+              <button
+                type="button"
+                class="pill-radio"
+                role="radio"
+                aria-checked="false"
+                data-dtype="build"
+                data-tip-title="构建打包 (build)"
+                data-tip-body="执行 python -I -m zipapp 打包生成独立可运行的 app.pyz 归档产物。"
+              >
+                构建 <code>build</code>
+              </button>
+            </div>
+
+            <div class="ctrl-divider"></div>
+
+            <div
+              class="dispatch-timeout"
+              data-tip-title="单调时钟超时上限"
+              data-tip-body="范围 1–300 秒，仅从任务进入 running 状态时开始计时；超时自动强杀整棵子进程组。"
+            >
+              <label for="direct-timeout-input" class="ctrl-label">限时</label>
+              <div class="num-input-box">
+                <input id="direct-timeout-input" type="number" min="1" max="300" step="1" value="30" required />
+                <span>s</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="dispatch-right">
+            <span id="direct-error-msg" class="inline-err" hidden></span>
+            <button id="direct-submit-btn" type="submit" class="primary-cta">▶ 提交任务</button>
+          </div>
+        </form>
+      </section>
+
+      <!-- 第三区：6 大能力演示 & 干爽实时流程图 -->
+      <section id="capability-lab" class="section-block" aria-labelledby="lab-heading">
+        <div class="section-head">
+          <div class="eyebrow-row">
+            <h2 id="lab-heading" class="section-title">核心能力演示</h2>
+            <span
+              class="hint-dot"
+              tabindex="0"
+              data-tip-title="标准化能力验证"
+              data-tip-body="6 组一键实验覆盖考察题全部可靠性与并发要求；展示每组演示所调用的任务与验证能力，右侧流程图随真实执行状态动态点亮。"
+            >?</span>
+          </div>
+        </div>
+
+        <div class="lab-split">
+          <!-- 左侧清爽场景导航 -->
+          <div id="scenario-list" class="scenario-list" role="tablist" aria-label="能力演示列表"></div>
+
+          <!-- 右侧纯粹流程图画布 -->
+          <div class="flow-stage-card">
+            <div class="flow-stage-top">
+              <div class="flow-stage-meta">
+                <div class="flow-stage-title-row">
+                  <span id="stage-scen-num" class="scen-badge">05</span>
+                  <h3 id="stage-scen-title" class="flow-stage-title">双槽并发与队列自动补位</h3>
+                  <span id="stage-info-pill" class="info-hover-pill" tabindex="0">ⓘ 原理与预期</span>
+                </div>
+
+                <div class="recipe-inline">
+                  <span class="recipe-label">调用任务</span>
+                  <div id="stage-tasks-used" class="recipe-chips"></div>
+                  <span class="recipe-sep">·</span>
+                  <span class="recipe-label">测试能力</span>
+                  <span id="stage-capability-short" class="cap-pill"></span>
+                </div>
+              </div>
+
+              <div class="flow-stage-btns">
+                <button id="scen-manual-btn" type="button" class="secondary-cta" hidden>手动取消</button>
+                <button id="scen-run-btn" type="button" class="primary-cta primary-cta--glow">▶ 运行演示</button>
+              </div>
+            </div>
+
+            <!-- 宽敞点阵流程图 -->
+            <div id="flowchart-box" class="flowchart-box"></div>
+
+            <!-- 仅并发批次活跃时展示切换条 -->
+            <div id="concurrency-batch-strip" class="batch-strip" hidden>
+              <span class="batch-strip-title">并发批次（点击切终端）：</span>
+              <div id="concurrency-batch-chips" class="batch-chips"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 第四区：执行队列、SSE 终端与结果检视 -->
+      <section id="live-cockpit" class="section-block" aria-labelledby="cockpit-heading">
+        <div class="section-head">
+          <h2 id="cockpit-heading" class="section-title">实时终端与任务检视</h2>
+        </div>
+
+        <div class="cockpit-grid">
+          <!-- 左：队列历史 -->
+          <div class="cockpit-card cockpit-card--list">
+            <div class="card-bar">
+              <div class="card-bar-left">
+                <span class="card-bar-title">任务记录</span>
+                <span id="history-total-pill" class="count-pill">0</span>
+              </div>
+            </div>
+            <div class="list-filters" role="tablist" aria-label="状态筛选">
+              <button type="button" role="tab" class="f-tab" aria-selected="true" data-filter="all">全部</button>
+              <button type="button" role="tab" class="f-tab" aria-selected="false" data-filter="active">运行</button>
+              <button type="button" role="tab" class="f-tab" aria-selected="false" data-filter="succeeded">成功</button>
+              <button type="button" role="tab" class="f-tab" aria-selected="false" data-filter="abnormal">异常</button>
+            </div>
+            <ul id="history-list" class="history-list" aria-label="任务列表"></ul>
+            <div id="history-empty" class="empty-tip" hidden>暂无匹配记录</div>
+          </div>
+
+          <!-- 中：SSE 实时终端 -->
+          <div class="cockpit-console">
+            <div class="console-bar">
+              <div class="console-bar-left">
+                <span class="console-bar-title">终端输出</span>
+                <span id="sse-pill" class="sse-pill" hidden>● SSE 实时</span>
+                <span
+                  id="trunc-pill"
+                  class="trunc-badge"
+                  hidden
+                  data-tip-title="已触发 64 KB 日志截断保护"
+                  data-tip-body="数据库仅保留前 65,536 字节输出；执行器仍继续非阻塞读取并丢弃后续管道数据，防止子进程写满缓冲区死锁。"
+                >
+                  已截断 64 KB ⓘ
+                </span>
+              </div>
+              <div class="console-bar-right">
+                <span id="log-byte-counter" class="byte-counter">0 B / 64 KB</span>
+                <button id="copy-log-btn" type="button" class="dark-mini-btn">复制</button>
+              </div>
+            </div>
+            <div id="log-scroll-box" class="log-scroll-box" tabindex="0" role="region" aria-label="终端日志">
+              <div id="log-rows" class="log-rows"></div>
+            </div>
+          </div>
+
+          <!-- 右：状态、产物、源码 -->
+          <div class="cockpit-card cockpit-card--detail">
+            <div id="detail-placeholder" class="detail-placeholder">
+              <strong>未选中任务</strong>
+              <p>选择左侧任务或发起运行即可查看详情</p>
+            </div>
+
+            <div id="detail-main" class="detail-main" hidden>
+              <div class="detail-top">
+                <div>
+                  <div class="detail-name-line">
+                    <span id="det-project" class="det-project">hello</span>
+                    <code id="det-type" class="det-type">test</code>
+                    <span id="det-status" class="status-pill" data-status="queued">排队中</span>
+                  </div>
+                  <div class="detail-id-line">
+                    <button
+                      id="copy-uuid-btn"
+                      type="button"
+                      class="uuid-btn"
+                      data-tip-title="点击复制完整 UUID"
+                      data-tip-body="可用于命令行调用 GET /tasks/{id} 查询。"
+                    >
+                      <code id="det-uuid">—</code>
+                    </button>
+                    <span id="det-source-badge" class="mini-tag">预置仓库</span>
+                  </div>
+                </div>
+
+                <div class="detail-btns">
+                  <button id="det-cancel-btn" type="button" class="sm-btn sm-btn--danger" hidden>取消</button>
+                  <button id="det-edit-btn" type="button" class="sm-btn sm-btn--ghost">改码</button>
+                  <button id="det-rerun-btn" type="button" class="sm-btn sm-btn--dark">重跑</button>
+                </div>
+              </div>
+
+              <div class="sub-tabs" role="tablist">
+                <button type="button" role="tab" class="s-tab" aria-selected="true" data-stab="overview">状态</button>
+                <button type="button" role="tab" class="s-tab" aria-selected="false" data-stab="artifacts">
+                  产物 <span id="det-art-cnt" class="s-cnt">0</span>
+                </button>
+                <button type="button" role="tab" class="s-tab" aria-selected="false" data-stab="source">
+                  源码 <span id="det-src-cnt" class="s-cnt">0</span>
+                </button>
+              </div>
+
+              <div id="stab-overview" class="stab-body">
+                <div id="det-alert" class="alert-box" data-tone="error" hidden></div>
+                <dl class="stat-grid">
+                  <div class="stat-box">
+                    <dt>开始</dt>
+                    <dd id="det-started">—</dd>
+                  </div>
+                  <div class="stat-box">
+                    <dt>结束</dt>
+                    <dd id="det-finished">—</dd>
+                  </div>
+                  <div class="stat-box">
+                    <dt>耗时 / 限时</dt>
+                    <dd id="det-duration">—</dd>
+                  </div>
+                  <div class="stat-box">
+                    <dt>退出码</dt>
+                    <dd id="det-exit">—</dd>
+                  </div>
+                </dl>
+              </div>
+
+              <div id="stab-artifacts" class="stab-body" hidden>
+                <div id="art-empty" class="art-empty">终态发布后开放下载</div>
+                <div id="art-list" class="art-list" hidden></div>
+                <div id="art-json-box" class="art-json-box" hidden>
+                  <div class="art-json-head">
+                    <code id="art-json-name">result.json</code>
+                    <button id="close-art-json-btn" type="button" class="dark-mini-btn">收起</button>
+                  </div>
+                  <pre id="art-json-pre" class="art-json-pre"></pre>
+                </div>
+              </div>
+
+              <div id="stab-source" class="stab-body stab-body--code" hidden>
+                <div id="det-src-tabs" class="code-tab-strip" role="tablist"></div>
+                <div id="det-src-code" class="code-read-box"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 弹窗：在线改码 & 本地 ZIP 上传 -->
+    <div id="studio-modal" class="modal-backdrop" hidden role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-sheet">
+        <div class="modal-head">
+          <div class="modal-head-left">
+            <h3 id="modal-title" class="modal-title">扩展代码来源</h3>
+            <div class="modal-mode-pills" role="tablist">
+              <button type="button" role="tab" class="m-pill" aria-selected="true" data-modal-mode="inline">
+                在线修改代码
+              </button>
+              <button type="button" role="tab" class="m-pill" aria-selected="false" data-modal-mode="archive">
+                上传 .zip 包
+              </button>
+            </div>
+          </div>
+          <button id="close-modal-btn" type="button" class="sm-btn sm-btn--ghost">Esc</button>
+        </div>
+
+        <form id="modal-form" class="modal-body" novalidate>
+          <div id="modal-inline-pane" class="modal-inline-pane">
+            <div class="modal-meta-bar">
+              <div class="modal-field">
+                <label for="modal-label-input">任务名</label>
+                <input id="modal-label-input" type="text" maxlength="60" value="hello-edited" />
+              </div>
+              <button id="modal-add-file-btn" type="button" class="sm-btn sm-btn--ghost">+ 新建文件</button>
+            </div>
+
+            <div class="modal-editor-wrap">
+              <div id="modal-file-tabs" class="code-tab-strip" role="tablist"></div>
+              <textarea id="modal-textarea" class="modal-textarea" spellcheck="false" aria-label="源码编辑器"></textarea>
+            </div>
+          </div>
+
+          <div id="modal-archive-pane" class="modal-archive-pane" hidden>
+            <label id="modal-zip-drop" class="zip-dropzone" for="modal-zip-input">
+              <input id="modal-zip-input" type="file" accept=".zip,application/zip" hidden />
+              <strong id="modal-zip-title" class="zip-title">点击选择或拖拽 <code>.zip</code> 项目包</strong>
+              <span id="modal-zip-sub" class="zip-sub">上限 2 MiB · 自动拦截路径穿越与符号链接</span>
+            </label>
+          </div>
+
+          <div id="modal-error" class="alert-box" data-tone="error" hidden></div>
+
+          <div class="modal-foot">
+            <div class="modal-exec-opts">
+              <div class="pill-radios" id="modal-type-radios">
+                <button type="button" class="pill-radio" data-mtype="lint" aria-checked="false">
+                  检查 <code>lint</code>
+                </button>
+                <button type="button" class="pill-radio" data-mtype="test" aria-checked="true">
+                  测试 <code>test</code>
+                </button>
+                <button type="button" class="pill-radio" data-mtype="build" aria-checked="false">
+                  构建 <code>build</code>
+                </button>
+              </div>
+              <div class="dispatch-timeout">
+                <label for="modal-timeout-input" class="ctrl-label">限时</label>
+                <div class="num-input-box">
+                  <input id="modal-timeout-input" type="number" min="1" max="300" value="30" required />
+                  <span>s</span>
+                </div>
+              </div>
+            </div>
+
+            <button id="modal-submit-btn" type="submit" class="primary-cta">▶ 隔离沙箱运行 ⌘↵</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="toast-box" class="toast-box" aria-live="polite"></div>
+
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>

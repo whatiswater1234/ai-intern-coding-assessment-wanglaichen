@@ -6,7 +6,7 @@
 
 ## 1. 本机环境与启动方式
 
-本机通过 uv 选用 Python 3.12。FastAPI 和 Pydantic 负责 HTTP 路由与字段校验，Uvicorn 在回环地址提供服务，依赖版本由 uv.lock 固定。执行器使用标准库的 sqlite3、subprocess、select 和 signal。交互文档在 /docs，机器可读的接口声明在 /openapi.json。
+本机通过 uv 选用 Python 3.12。FastAPI 和 Pydantic 负责 HTTP 路由与字段校验，Uvicorn 在回环地址提供服务，依赖版本由 uv.lock 固定。执行器使用标准库的 sqlite3、subprocess、select 和 signal。根路径 `/` 同源托管零构建依赖的本机任务工作台前端（`task_service/web/`），交互文档在 `/docs`，机器可读的接口声明在 `/openapi.json`。
 
 | 入口 | 作用 |
 | --- | --- |
@@ -39,9 +39,14 @@
 
 | 接口 | 调用方看到的结果 |
 | --- | --- |
-| `POST /tasks` | 202，返回 `{"id":"<uuid>","status":"queued"}`，Location 指向状态接口。再次提交会创建新任务 |
-| `GET /tasks/{id}` | 200，返回下方的任务快照。所有时间为 UTC RFC 3339，尚未发生的事件为 null |
-| `GET /tasks/{id}/logs` | 200，返回 `{"text":"…","truncated":false}`。允许在执行中轮询，尚无输出时 text 为空 |
+| `GET /` | 200，返回同源单页一体化 TaskRunner 工作台（`/static/*` 提供原生 ES Module、动态 SVG 流程图引擎与样式资源，零前端构建依赖） |
+| `GET /telemetry` | 200，采集宿主机负载、各运行槽命令进程组（PGID）的存活进程数/CPU%/RSS 内存、活跃 `work/<id>` 沙箱数、平均排队耗时与 SQLite 存储体积 |
+| `GET /projects`、`GET /projects/{id}/files` | 200，返回可用预置项目特征、源码文件树以及并发/队列/日志/产物/压缩包配额 |
+| `GET /tasks` | 200，按入队逆序返回最近任务快照（支持 `status` 与 `limit` 过滤），并附带活动运行项与排队计数 |
+| `POST /tasks` | 202，接受预置 `project_id` 或在线源码字典 `files`（二选一），返回 `{"id":"<uuid>","status":"queued"}` |
+| `POST /tasks/archive` | 202，接受 `<= 2 MiB` 的 `.zip` 压缩包（自动剥离单层外目录与 `__MACOSX`，拦截路径穿越、加密包与符号链接） |
+| `GET /tasks/{id}`、`GET /tasks/{id}/source` | 200，返回任务状态快照或该任务实际执行的源码快照列表 |
+| `GET /tasks/{id}/logs`、`GET /tasks/{id}/events` | 200，返回已收集日志快照，或通过 SSE (`text/event-stream`) 实时推送状态与增量输出并在终态自动关闭 |
 | `POST /tasks/{id}/cancel` | 排队中直接取消并返回 200；运行中登记停止请求并返回 202；任务已结束时返回 200 和原快照 |
 | `GET /tasks/{id}/artifacts` | 200，返回 `{"items":[]}` 或含 name、size_bytes、download_url 的列表。终态发布前列表为空 |
 | `GET /tasks/{id}/artifacts/{name}` | 200，以记录的媒体类型返回原始字节；按任务 ID 和完整产物名查库 |
